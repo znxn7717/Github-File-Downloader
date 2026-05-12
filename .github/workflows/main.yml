@@ -1,5 +1,5 @@
 ---
-name: ⬇️  01- Download URL
+name: ⬇️ 01 - Download URL
 
 on:
   workflow_dispatch:
@@ -136,11 +136,9 @@ jobs:
             echo "Password protection: DISABLED"
           fi
 
-          # System info for auto compression estimation
           CPU_CORES=$(nproc)
           echo "CPU cores available: $CPU_CORES"
-          # Maximum time we want to spend on archiving (seconds) – 5.5 hours
-          MAX_ARCHIVE_TIME_SEC=19800
+          MAX_ARCHIVE_TIME_SEC=19800   # 5.5 hours
 
           mkdir -p downloads tmp_downloads
 
@@ -319,11 +317,10 @@ jobs:
 
           # ---------- Compression level selector (with Auto prediction) ----------
           determine_compression_level() {
-            local TOTAL_SIZE="$1"       # bytes
+            local TOTAL_SIZE="$1"
             local PRESET="$2"
             local CORES="$3"
 
-            # Manual preset mapping
             case "$PRESET" in
               best)     echo 9; return ;;
               great)    echo 7; return ;;
@@ -333,8 +330,6 @@ jobs:
             esac
 
             # Auto: estimate time for each level and pick the highest safe one
-            # Approximate compression speeds (MB/s per core) for typical pre‑compressed data.
-            # These are conservative estimates observed on GitHub runners.
             declare -A SPEED_MAP
             SPEED_MAP[9]=0.2
             SPEED_MAP[7]=0.5
@@ -367,7 +362,7 @@ jobs:
             local SPLIT_SIZE_MB="$3"
             local IS_DIRECTORY="$4"
             local PASSWORD="$5"
-            local MX_LEVEL="$6"         # now explicitly provided
+            local MX_LEVEL="$6"
 
             local -a CMD_ARGS=(7z a -t7z -mx=${MX_LEVEL})
             if [ -n "$PASSWORD" ]; then
@@ -403,7 +398,7 @@ jobs:
                 if [ -f "$f" ] && [ -s "$f" ]; then
                   cp "$f" "$TEMP_ARCHIVE_DIR/"
                   VALID_FILES=$((VALID_FILES + 1))
-                  local FSIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                  FSIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
                   TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
                 else
                   echo "Skipping empty or invalid file: $f"
@@ -513,7 +508,6 @@ jobs:
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
               FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
 
-              # Determine compression level for this file
               MX_LEVEL=$(determine_compression_level "$SIZE" "$COMPRESSION_PRESET" "$CPU_CORES")
               echo "Using compression level -mx=${MX_LEVEL} for ${BASENAME} (${SIZE} bytes)"
 
