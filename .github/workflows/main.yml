@@ -26,6 +26,18 @@ on:
         required: false
         default: ''
         type: string
+      compression_preset:
+        description: '📊 Size Preset (Compression Level, Default: Auto)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - best
+          - great
+          - good
+          - fast
+          - fastest
 
 env:
   CODES_URL: ""
@@ -91,6 +103,7 @@ jobs:
           URLS="${{ github.event.inputs.urls }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
           PART_SIZE_MB_RAW="${{ github.event.inputs.part_size_mb }}"
+          COMPRESSION_PRESET="${{ github.event.inputs.compression_preset }}"
 
           # Validate and clamp part size between 10 and 90 MB
           if [[ -z "$PART_SIZE_MB_RAW" ]]; then
@@ -115,6 +128,7 @@ jobs:
 
           echo "Downloading with mode: $MODE"
           echo "Part size: ${PART_SIZE_MB} MB (clamped to 10–90 range)"
+          echo "Compression preset: ${COMPRESSION_PRESET}"
           echo "Backup directory: $BACKUP_DIR"
           if [ -n "$ZIP_PASSWORD" ]; then
             echo "Password protection: ENABLED"
@@ -122,13 +136,16 @@ jobs:
             echo "Password protection: DISABLED"
           fi
 
+          # System info for auto compression estimation
+          CPU_CORES=$(nproc)
+          echo "CPU cores available: $CPU_CORES"
+          # Maximum time we want to spend on archiving (seconds) – 5.5 hours
+          MAX_ARCHIVE_TIME_SEC=19800
+
           mkdir -p downloads tmp_downloads
 
           # ---------- Keep‑alive runner ----------
           keepalive_exec() {
-            # Run a command in background and print a message every 30s
-            # to prevent the runner from timing out due to no output.
-            # Usage: keepalive_exec "description" command [args...]
             local desc="$1"; shift
             echo "$desc starting..."
             "$@" > /dev/null 2>&1 &
@@ -244,8 +261,6 @@ jobs:
                 --out="$FILENAME" \
                 "$URL" 2>&1)
 
-              # aria2c prints progress, so no extra keep-alive needed
-
               if [ -f "tmp_downloads/$FILENAME" ] && [ -s "tmp_downloads/$FILENAME" ]; then
                 local FILE_SIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo "0")
                 if [ "$FILE_SIZE" -gt 0 ]; then
@@ -258,7 +273,6 @@ jobs:
               rm -f "tmp_downloads/$FILENAME" "tmp_downloads/$FILENAME.aria2"
               echo "aria2c failed or file empty, trying curl fallback..."
 
-              # curl also shows progress bar with -#
               ERROR_LOG=$(curl -L -f -# \
                 --retry 3 \
                 --retry-delay 5 \
@@ -303,33 +317,58 @@ jobs:
             download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
           done
 
-          # ---------- Archive creation with adaptive compression and keep‑alive ----------
+          # ---------- Compression level selector (with Auto prediction) ----------
+          determine_compression_level() {
+            local TOTAL_SIZE="$1"       # bytes
+            local PRESET="$2"
+            local CORES="$3"
+
+            # Manual preset mapping
+            case "$PRESET" in
+              best)     echo 9; return ;;
+              great)    echo 7; return ;;
+              good)     echo 5; return ;;
+              fast)     echo 3; return ;;
+              fastest)  echo 1; return ;;
+            esac
+
+            # Auto: estimate time for each level and pick the highest safe one
+            # Approximate compression speeds (MB/s per core) for typical pre‑compressed data.
+            # These are conservative estimates observed on GitHub runners.
+            declare -A SPEED_MAP
+            SPEED_MAP[9]=0.2
+            SPEED_MAP[7]=0.5
+            SPEED_MAP[5]=1.0
+            SPEED_MAP[3]=2.0
+            SPEED_MAP[1]=5.0
+
+            local SIZE_MB=$(( TOTAL_SIZE / 1048576 ))
+            echo "Auto mode: estimating optimal compression level for ${SIZE_MB}MB on ${CORES} cores (max archive time ${MAX_ARCHIVE_TIME_SEC}s)..."
+
+            local CHOSEN_LEVEL=1
+            for level in 9 7 5 3 1; do
+              local SPEED=${SPEED_MAP[$level]}
+              local EST_TIME=$(echo "scale=0; $SIZE_MB / ($SPEED * $CORES)" | bc)
+              echo "  -mx=${level}: estimated ${EST_TIME}s"
+              if [ "$EST_TIME" -le "$MAX_ARCHIVE_TIME_SEC" ]; then
+                CHOSEN_LEVEL=$level
+                break
+              fi
+            done
+
+            echo "Auto selected compression level -mx=${CHOSEN_LEVEL}"
+            echo "$CHOSEN_LEVEL"
+          }
+
+          # ---------- Archive creation ----------
           create_high_ratio_archive() {
-            local SOURCE_PATH="$1"      # file or directory to archive
-            local OUTPUT_BASE="$2"      # full path base name (without .7z or .7z.001)
-            local SPLIT_SIZE_MB="$3"    # empty or positive number
-            local IS_DIRECTORY="$4"     # "yes" or "no"
-            local PASSWORD="$5"         # optional password
+            local SOURCE_PATH="$1"
+            local OUTPUT_BASE="$2"
+            local SPLIT_SIZE_MB="$3"
+            local IS_DIRECTORY="$4"
+            local PASSWORD="$5"
+            local MX_LEVEL="$6"         # now explicitly provided
 
-            # Determine total size to choose appropriate compression level
-            local TOTAL_SIZE=0
-            if [ "$IS_DIRECTORY" = "yes" ]; then
-              TOTAL_SIZE=$(du -sb "$SOURCE_PATH" 2>/dev/null | cut -f1)
-            else
-              TOTAL_SIZE=$(stat -c%s "$SOURCE_PATH" 2>/dev/null || echo 0)
-            fi
-            TOTAL_SIZE=${TOTAL_SIZE:-0}
-
-            local MX_LEVEL=9
-            if [ "$TOTAL_SIZE" -gt 10737418240 ]; then      # > 10 GB
-              MX_LEVEL=5
-            elif [ "$TOTAL_SIZE" -gt 1073741824 ]; then     # > 1 GB
-              MX_LEVEL=7
-            fi
-
-            echo "Using 7z compression level -mx=${MX_LEVEL} for $(basename "$SOURCE_PATH") ($TOTAL_SIZE bytes)"
-
-            # Build command arguments as an array (prevents quoting issues)
             local -a CMD_ARGS=(7z a -t7z -mx=${MX_LEVEL})
             if [ -n "$PASSWORD" ]; then
               CMD_ARGS+=(-p"$PASSWORD")
@@ -337,14 +376,13 @@ jobs:
             if [ -n "$SPLIT_SIZE_MB" ] && [ "$SPLIT_SIZE_MB" -gt 0 ]; then
               CMD_ARGS+=(-v${SPLIT_SIZE_MB}m)
             fi
-
             if [ "$IS_DIRECTORY" = "yes" ]; then
               CMD_ARGS+=("${OUTPUT_BASE}.7z" "$SOURCE_PATH/")
             else
               CMD_ARGS+=("${OUTPUT_BASE}.7z" "$SOURCE_PATH")
             fi
 
-            # Run with keep‑alive to prevent 10‑min idle timeout
+            echo "7z command: ${CMD_ARGS[*]}"
             keepalive_exec "7z archive" "${CMD_ARGS[@]}"
           }
 
@@ -357,22 +395,26 @@ jobs:
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
               echo "Creating 7z multi‑volume archive in folder: $BACKUP_DIR/$FOLDER_NAME"
 
-              # Copy all valid files to a temporary directory
               TEMP_ARCHIVE_DIR="/tmp/7z_temp_$$"
               mkdir -p "$TEMP_ARCHIVE_DIR"
               VALID_FILES=0
+              TOTAL_SIZE=0
               for f in tmp_downloads/*; do
                 if [ -f "$f" ] && [ -s "$f" ]; then
                   cp "$f" "$TEMP_ARCHIVE_DIR/"
                   VALID_FILES=$((VALID_FILES + 1))
+                  local FSIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                  TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
                 else
                   echo "Skipping empty or invalid file: $f"
                 fi
               done
 
               if [ $VALID_FILES -gt 0 ]; then
+                MX_LEVEL=$(determine_compression_level "$TOTAL_SIZE" "$COMPRESSION_PRESET" "$CPU_CORES")
+                echo "Using compression level -mx=${MX_LEVEL} for combined archive (${TOTAL_SIZE} bytes total)"
                 ARCHIVE_BASE="$BACKUP_DIR/$FOLDER_NAME/$ARCHIVE_NAME"
-                create_high_ratio_archive "$TEMP_ARCHIVE_DIR" "$ARCHIVE_BASE" "$PART_SIZE_MB" "yes" "$ZIP_PASSWORD"
+                create_high_ratio_archive "$TEMP_ARCHIVE_DIR" "$ARCHIVE_BASE" "$PART_SIZE_MB" "yes" "$ZIP_PASSWORD" "$MX_LEVEL"
                 rm -rf "$TEMP_ARCHIVE_DIR"
 
                 PARTS_COUNT=$(ls "$BACKUP_DIR/$FOLDER_NAME/"*.7z.* 2>/dev/null | wc -l)
@@ -407,7 +449,7 @@ jobs:
                     echo "|----------|-------|"
                     echo "| **Archive Name** | \`${ARCHIVE_NAME}.7z\` |"
                     echo "| **Total Size** | ${ARCHIVE_SIZE_MB} MB (${LINK_NUM} parts) |"
-                    echo "| **Compression** | 7‑Zip LZMA2 compression |"
+                    echo "| **Compression** | 7‑Zip LZMA2 compression (level ${MX_LEVEL}) |"
                     if [ -n "$ZIP_PASSWORD" ]; then
                       echo "| **Password** | \`${ZIP_PASSWORD}\` |"
                     fi
@@ -446,7 +488,7 @@ jobs:
             rm -rf tmp_downloads
 
           else
-            # Normal mode: each downloaded file gets its own archive (split if large)
+            # Normal mode: each file gets its own archive (split if large)
             for FILE in tmp_downloads/*; do
               [ -f "$FILE" ] || continue
 
@@ -457,7 +499,6 @@ jobs:
               fi
 
               SIZE=$(stat -c%s "$FILE")
-
               if [ "$SIZE" -le 0 ]; then
                 echo "WARNING: File has zero or invalid size: $FILE"
                 rm -f "$FILE"
@@ -470,14 +511,17 @@ jobs:
 
               FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BASENAME_NO_EXT")
               mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
-
               FOLDER_ENCODED=$(urlencode "${FOLDER_NAME}")
+
+              # Determine compression level for this file
+              MX_LEVEL=$(determine_compression_level "$SIZE" "$COMPRESSION_PRESET" "$CPU_CORES")
+              echo "Using compression level -mx=${MX_LEVEL} for ${BASENAME} (${SIZE} bytes)"
 
               if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
                 echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - creating 7z multi‑volume archive (${PART_SIZE_MB}MB parts)"
 
                 ARCHIVE_BASE="$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}"
-                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "$PART_SIZE_MB" "no" "$ZIP_PASSWORD"
+                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "$PART_SIZE_MB" "no" "$ZIP_PASSWORD" "$MX_LEVEL"
 
                 PARTS_COUNT=$(ls "$BACKUP_DIR/${FOLDER_NAME}/"*.7z.* 2>/dev/null | wc -l)
                 echo "Parts created in folder $BACKUP_DIR/$FOLDER_NAME: $PARTS_COUNT files"
@@ -520,7 +564,7 @@ jobs:
                   printf '%s\n' "|----------|-------|"
                   printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
                   printf '%s\n' "| **Total Size** | **${PARTS_COUNT} parts** - **${TOTAL_SIZE_MB} MB** |"
-                  printf '%s\n' "| **Compression** | 7‑Zip LZMA2 compression |"
+                  printf '%s\n' "| **Compression** | 7‑Zip LZMA2 compression (level ${MX_LEVEL}) |"
                   if [ -n "$ZIP_PASSWORD" ]; then
                     printf '%s\n' "| **Password** | \`${ZIP_PASSWORD}\` |"
                   fi
@@ -558,7 +602,7 @@ jobs:
                 echo "$BASENAME - creating single 7z archive in folder: $BACKUP_DIR/$FOLDER_NAME"
 
                 ARCHIVE_BASE="$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}"
-                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "" "no" "$ZIP_PASSWORD"
+                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "" "no" "$ZIP_PASSWORD" "$MX_LEVEL"
 
                 if [ ! -s "${ARCHIVE_BASE}.7z" ]; then
                   echo "ERROR: Failed to create archive for $BASENAME"
@@ -582,7 +626,7 @@ jobs:
                   printf '%s\n' "|----------|-------|"
                   printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
                   printf '%s\n' "| **Size** | ${SIZE_MB} MB |"
-                  printf '%s\n' "| **Compression** | 7‑Zip LZMA2 compression |"
+                  printf '%s\n' "| **Compression** | 7‑Zip LZMA2 compression (level ${MX_LEVEL}) |"
                   if [ -n "$ZIP_PASSWORD" ]; then
                     printf '%s\n' "| **Password** | \`${ZIP_PASSWORD}\` |"
                   fi
@@ -877,7 +921,6 @@ jobs:
             ALL_FILES+=("$FILE")
           done < <(find downloads -name "README.md" -print0 2>/dev/null)
 
-          # Also capture .7z and .7z.* files (split volumes) and other common formats
           while IFS= read -r -d '' FILE; do
             ALL_FILES+=("$FILE")
           done < <(find downloads -type f \( -name "*.7z" -o -name "*.7z.*" -o -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.exe" -o -name "*.iso" -o -name "*.tar*" -o -name "*.rar" \) -print0 2>/dev/null | sort -z)
