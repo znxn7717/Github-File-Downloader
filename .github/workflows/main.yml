@@ -22,7 +22,7 @@ on:
         default: '45'
         type: string
       password:
-        description: '🔒 Password for archive (optional, not implemented)'
+        description: '🔒 Password for archive (optional)'
         required: false
         default: ''
         type: string
@@ -117,7 +117,7 @@ jobs:
           echo "Part size: ${PART_SIZE_MB} MB (clamped to 10–90 range)"
           echo "Backup directory: $BACKUP_DIR"
           if [ -n "$ZIP_PASSWORD" ]; then
-            echo "Password protection: ENABLED (not actually implemented)"
+            echo "Password protection: ENABLED"
           else
             echo "Password protection: DISABLED"
           fi
@@ -281,28 +281,28 @@ jobs:
             download_with_retry "$URL" "$FILENAME" || echo "Failed to download: $FILENAME"
           done
 
-          # ---------- Helper to create a high‑ratio 7z archive (single or split) ----------
+          # ---------- Helper to create a high‑ratio 7z archive (single or split) with optional password ----------
           create_high_ratio_archive() {
             local SOURCE_PATH="$1"      # file or directory to archive
             local OUTPUT_BASE="$2"      # full path base name (without .7z or .7z.001)
-            local SPLIT_SIZE_MB="$3"
+            local SPLIT_SIZE_MB="$3"    # empty or positive number
             local IS_DIRECTORY="$4"     # "yes" or "no"
+            local PASSWORD="$5"         # optional password
 
-            if [ "$IS_DIRECTORY" = "yes" ]; then
-              # Archive a directory (used in zip mode)
-              if [ -n "$SPLIT_SIZE_MB" ] && [ "$SPLIT_SIZE_MB" -gt 0 ]; then
-                7z a -t7z -mx=9 -v${SPLIT_SIZE_MB}m -mmt=off "${OUTPUT_BASE}.7z" "$SOURCE_PATH/" > /dev/null 2>&1
-              else
-                7z a -t7z -mx=9 -mmt=off "${OUTPUT_BASE}.7z" "$SOURCE_PATH/" > /dev/null 2>&1
-              fi
-            else
-              # Archive a single file
-              if [ -n "$SPLIT_SIZE_MB" ] && [ "$SPLIT_SIZE_MB" -gt 0 ]; then
-                7z a -t7z -mx=9 -v${SPLIT_SIZE_MB}m -mmt=off "${OUTPUT_BASE}.7z" "$SOURCE_PATH" > /dev/null 2>&1
-              else
-                7z a -t7z -mx=9 -mmt=off "${OUTPUT_BASE}.7z" "$SOURCE_PATH" > /dev/null 2>&1
-              fi
+            local CMD="7z a -t7z -mx=9 -mmt=off"
+            if [ -n "$PASSWORD" ]; then
+              CMD="$CMD -p\"$PASSWORD\""
             fi
+            if [ -n "$SPLIT_SIZE_MB" ] && [ "$SPLIT_SIZE_MB" -gt 0 ]; then
+              CMD="$CMD -v${SPLIT_SIZE_MB}m"
+            fi
+            if [ "$IS_DIRECTORY" = "yes" ]; then
+              CMD="$CMD \"${OUTPUT_BASE}.7z\" \"$SOURCE_PATH/\""
+            else
+              CMD="$CMD \"${OUTPUT_BASE}.7z\" \"$SOURCE_PATH\""
+            fi
+
+            eval "$CMD > /dev/null 2>&1"
           }
 
           # ---------- Process according to mode ----------
@@ -329,7 +329,7 @@ jobs:
 
               if [ $VALID_FILES -gt 0 ]; then
                 ARCHIVE_BASE="$BACKUP_DIR/$FOLDER_NAME/$ARCHIVE_NAME"
-                create_high_ratio_archive "$TEMP_ARCHIVE_DIR" "$ARCHIVE_BASE" "$PART_SIZE_MB" "yes"
+                create_high_ratio_archive "$TEMP_ARCHIVE_DIR" "$ARCHIVE_BASE" "$PART_SIZE_MB" "yes" "$ZIP_PASSWORD"
                 rm -rf "$TEMP_ARCHIVE_DIR"
 
                 PARTS_COUNT=$(ls "$BACKUP_DIR/$FOLDER_NAME/"*.7z.* 2>/dev/null | wc -l)
@@ -365,6 +365,9 @@ jobs:
                     echo "| **Archive Name** | \`${ARCHIVE_NAME}.7z\` |"
                     echo "| **Total Size** | ${ARCHIVE_SIZE_MB} MB (${LINK_NUM} parts) |"
                     echo "| **Compression** | Ultra (7‑Zip LZMA2, -mx=9) |"
+                    if [ -n "$ZIP_PASSWORD" ]; then
+                      echo "| **Password** | \`${ZIP_PASSWORD}\` |"
+                    fi
                     echo "| **Status** | **Complete (100%)** |"
                     echo ""
                     echo "---"
@@ -381,7 +384,12 @@ jobs:
                     echo ""
                     echo "1. **Download all parts** (\`.7z.001\`, \`.7z.002\`, ...)"
                     echo "2. **Open** \`${ARCHIVE_NAME}.7z.001\` with **7‑Zip**, **WinRAR**, or **Ark**"
-                    echo "3. **Extract** — all parts combine automatically"
+                    if [ -n "$ZIP_PASSWORD" ]; then
+                      echo "3. **Enter the password** when prompted: \`${ZIP_PASSWORD}\`"
+                      echo "4. **Extract** — all parts combine automatically"
+                    else
+                      echo "3. **Extract** — all parts combine automatically"
+                    fi
                     echo ""
                     echo "---"
                     echo ""
@@ -426,7 +434,7 @@ jobs:
                 echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - creating high‑ratio 7z multi‑volume archive (${PART_SIZE_MB}MB parts)"
 
                 ARCHIVE_BASE="$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}"
-                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "$PART_SIZE_MB" "no"
+                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "$PART_SIZE_MB" "no" "$ZIP_PASSWORD"
 
                 PARTS_COUNT=$(ls "$BACKUP_DIR/${FOLDER_NAME}/"*.7z.* 2>/dev/null | wc -l)
                 echo "Parts created in folder $BACKUP_DIR/$FOLDER_NAME: $PARTS_COUNT files"
@@ -470,6 +478,9 @@ jobs:
                   printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
                   printf '%s\n' "| **Total Size** | **${PARTS_COUNT} parts** - **${TOTAL_SIZE_MB} MB** |"
                   printf '%s\n' "| **Compression** | Ultra (7‑Zip LZMA2, -mx=9) |"
+                  if [ -n "$ZIP_PASSWORD" ]; then
+                    printf '%s\n' "| **Password** | \`${ZIP_PASSWORD}\` |"
+                  fi
                   printf '%s\n' "| **Status** | **Complete (100%)** |"
                   echo ""
                   echo "---"
@@ -486,7 +497,12 @@ jobs:
                   echo ""
                   echo "1. **Download all parts** (\`.7z.001\`, \`.7z.002\`, ...)"
                   echo "2. **Open** \`${FOLDER_NAME}.7z.001\` with **7‑Zip**, **WinRAR**, or **Ark**"
-                  echo "3. **Extract** — all parts combine automatically"
+                  if [ -n "$ZIP_PASSWORD" ]; then
+                    echo "3. **Enter the password** when prompted: \`${ZIP_PASSWORD}\`"
+                    echo "4. **Extract** — all parts combine automatically"
+                  else
+                    echo "3. **Extract** — all parts combine automatically"
+                  fi
                   echo ""
                   echo "---"
                   echo ""
@@ -499,7 +515,7 @@ jobs:
                 echo "$BASENAME - creating single high‑ratio 7z archive in folder: $BACKUP_DIR/$FOLDER_NAME"
 
                 ARCHIVE_BASE="$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}"
-                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "" "no"
+                create_high_ratio_archive "$FILE" "$ARCHIVE_BASE" "" "no" "$ZIP_PASSWORD"
 
                 if [ ! -s "${ARCHIVE_BASE}.7z" ]; then
                   echo "ERROR: Failed to create archive for $BASENAME"
@@ -524,6 +540,9 @@ jobs:
                   printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
                   printf '%s\n' "| **Size** | ${SIZE_MB} MB |"
                   printf '%s\n' "| **Compression** | Ultra (7‑Zip LZMA2, -mx=9) |"
+                  if [ -n "$ZIP_PASSWORD" ]; then
+                    printf '%s\n' "| **Password** | \`${ZIP_PASSWORD}\` |"
+                  fi
                   printf '%s\n' "| **Status** | **Complete (100%)** |"
                   echo ""
                   echo "---"
@@ -539,7 +558,12 @@ jobs:
                   echo "## How to Extract"
                   echo ""
                   echo "1. **Open** \`${FOLDER_NAME}.7z\` with **7‑Zip**, **WinRAR**, or **Ark**"
-                  echo "2. **Extract** the file"
+                  if [ -n "$ZIP_PASSWORD" ]; then
+                    echo "2. **Enter the password** when prompted: \`${ZIP_PASSWORD}\`"
+                    echo "3. **Extract** the file"
+                  else
+                    echo "2. **Extract** the file"
+                  fi
                   echo ""
                   echo "---"
                   echo ""
